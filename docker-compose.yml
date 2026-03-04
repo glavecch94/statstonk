@@ -1,0 +1,36 @@
+services:
+  scheduler:
+    build: .
+    restart: unless-stopped
+    command: python scheduler/runner.py
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard:
+    build: .
+    restart: unless-stopped
+    command: >
+      streamlit run dashboard/app.py
+      --server.headless true
+      --server.port 8501
+      --server.address 0.0.0.0
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8501:8501"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
