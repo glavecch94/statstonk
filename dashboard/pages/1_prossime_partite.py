@@ -8,6 +8,10 @@ Struttura card: confronto attacco/difesa (tabella) + segnali incrociati + pronos
 from __future__ import annotations
 
 from collections import Counter
+from datetime import UTC
+from zoneinfo import ZoneInfo
+
+_TZ_ROME = ZoneInfo("Europe/Rome")
 
 import pandas as pd
 import streamlit as st
@@ -383,7 +387,7 @@ _all_upcoming: list[dict] = load_all_upcoming_matches()
 for fixture in fixtures:
     home = fixture["home_team"]
     away = fixture["away_team"]
-    date_str = fixture["date"].strftime("%d/%m/%Y %H:%M")
+    date_str = fixture["date"].replace(tzinfo=UTC).astimezone(_TZ_ROME).strftime("%d/%m/%Y %H:%M")
     fixture_matchday = fixture.get("matchday")
 
     # Statistiche stagione corrente in casa / in trasferta

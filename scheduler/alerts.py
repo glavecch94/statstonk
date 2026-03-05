@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 _STATE_FILE = DATA_DIR / "live_alerts_state.json"
 _DAILY_JOBS_FILE = DATA_DIR / "daily_jobs_last_run.json"
+_INTERVENTIONS_FILE = DATA_DIR / "interventions.json"
 
 
 def _get_daily_last_run() -> dict:
@@ -69,6 +70,72 @@ def _set_daily_last_run(key: str) -> None:
         _DAILY_JOBS_FILE.write_text(json.dumps(data, indent=2))
     except Exception as exc:
         logger.warning("[alerts] Salvataggio daily_jobs fallito: %s", exc)
+# ── Interventi (tracking ok/ko) ────────────────────────────────────────────────
+
+
+def _load_interventions() -> list:
+    try:
+        if _INTERVENTIONS_FILE.exists():
+            return json.loads(_INTERVENTIONS_FILE.read_text())
+    except Exception:
+        pass
+    return []
+
+
+def _save_interventions(interventions: list) -> None:
+    try:
+        _INTERVENTIONS_FILE.write_text(json.dumps(interventions, indent=2))
+    except Exception as exc:
+        logger.warning("[alerts] Salvataggio interventions fallito: %s", exc)
+
+
+def _record_intervention(event_id: str, alert_type: str, team: str, match: str, comp: str, minute: int) -> None:
+    """Registra un nuovo intervento come pending."""
+    interventions = _load_interventions()
+    interventions.append({
+        "event_id": event_id,
+        "match": match,
+        "comp": comp,
+        "alert_type": alert_type,
+        "team": team,
+        "minute": minute,
+        "date": date.today().isoformat(),
+        "outcome": "pending",
+    })
+    _save_interventions(interventions)
+
+
+def _resolve_intervention(event_id: str, alert_type: str, outcome: str) -> None:
+    """Risolve il primo intervento pending per evento + tipo."""
+    interventions = _load_interventions()
+    for inv in interventions:
+        if inv["event_id"] == event_id and inv["alert_type"] == alert_type and inv["outcome"] == "pending":
+            inv["outcome"] = outcome
+            break
+    _save_interventions(interventions)
+
+
+def _resolve_all_pending(event_id: str, outcome: str) -> None:
+    """Risolve tutti gli interventi pending per un dato evento."""
+    interventions = _load_interventions()
+    changed = False
+    for inv in interventions:
+        if inv["event_id"] == event_id and inv["outcome"] == "pending":
+            inv["outcome"] = outcome
+            changed = True
+    if changed:
+        _save_interventions(interventions)
+
+
+def _interventions_stats_line() -> str:
+    """Riga riassuntiva degli interventi totali: ✅ N · ❌ N · ⏳ N."""
+    invs = _load_interventions()
+    ok  = sum(1 for i in invs if i["outcome"] == "ok")
+    ko  = sum(1 for i in invs if i["outcome"] == "ko")
+    pnd = sum(1 for i in invs if i["outcome"] == "pending")
+    return f"📊 Interventi: ✅ {ok} · ❌ {ko} · ⏳ {pnd}"
+
+
 _XG_GAP = 1.2          # xG > gol + questa soglia → alert / partita interessante
 _NO_LIVE_SKIP_SEC = 600  # secondi da attendere tra check quando non ci sono partite live
 _XG_ZERO_TOTAL = 1.8   # xG totale (home+away) ≥ soglia con score 0-0 → alert
@@ -151,18 +218,18 @@ def _stat(alltime: dict, stat_name: str, side: str) -> float | None:
 
 
 
-def _send_live_alert(text: str) -> None:
+def _send_live_alert(text: str, ev: dict | None = None) -> None:
     """Invia un alert live con intestazione standard."""
     _send(f"Intervento possibile 📶\n{text}")
 
 
 def _has_prior_alert(ev: dict) -> bool:
-    """True se è già stato inviato almeno un alert per questa partita."""
+    """True se ci sono ancora alert attivi (non risolti via follow-up) per questa partita."""
     return any(ev.get(k) for k in ("xg_home", "xg_away", "xg_zero", "da_dom"))
 
 
-def _send_final_message(ev: dict) -> None:
-    """Invia il messaggio di fine partita con esito dell'alert."""
+def _send_final_message(event_id: str, ev: dict) -> None:
+    """Invia il messaggio di fine partita con esito dell'alert e risolve gli interventi pending."""
     home = ev.get("home", "?")
     away = ev.get("away", "?")
     comp = ev.get("comp", "")
@@ -217,7 +284,8 @@ def _send_final_message(ev: dict) -> None:
     else:
         return  # nessun alert rilevante, non inviare nulla
 
-    _send(f"{header}\n{outcome}")
+    _resolve_all_pending(event_id, "ok" if outcome.startswith("✅") else "ko")
+    _send(f"{header}\n{outcome}\n{_interventions_stats_line()}")
 
 
 # ── Job principale ─────────────────────────────────────────────────────────────
@@ -283,7 +351,7 @@ def check_live_alerts() -> None:
         except (ValueError, TypeError):
             continue
         if eid_int not in active_ids and _has_prior_alert(ev):
-            _send_final_message(ev)
+            _send_final_message(eid_str, ev)
 
     state = {k: v for k, v in state.items() if k.lstrip("-").isdigit() and int(k) in active_ids}
     _save_state(state)  # persiste subito la rimozione dei match terminati
@@ -306,8 +374,35 @@ def check_live_alerts() -> None:
             as_ = (e.get("awayScore") or {}).get("current") or 0
             min_ = _minute(e)
 
+            score = f"{hs}-{as_}"
             score_disp = f"{hs}–{as_}"
             min_tag = f"  ·  {min_}'" if min_ else ""
+
+            # ── ⚽ Gol (aggiornamento solo se segna la squadra attesa) ──────────
+            prev = ev.get("score", "")
+            if prev and score != prev:
+                ph, pa = (int(x) for x in prev.split("-"))
+                home_scored = hs > ph
+                away_scored = as_ > pa
+                # home ha segnato ed era la squadra attesa
+                if home_scored and (ev.get("xg_home") or ev.get("xg_zero") or ev.get("dominant") == home):
+                    if ev.get("xg_home"):
+                        _resolve_intervention(str(eid), "xg_home", "ok")
+                    if ev.get("xg_zero"):
+                        _resolve_intervention(str(eid), "xg_zero", "ok")
+                    ev.pop("xg_home", None)
+                    ev.pop("xg_zero", None)
+                    _send(f"Aggiornamento intervento 🔄\n⚽ <b>GOAL{min_tag}</b>\n{comp}\n<b>{home}</b> {score_disp} {away}\n{_interventions_stats_line()}")  # noqa: E501
+                # away ha segnato ed era la squadra attesa
+                if away_scored and (ev.get("xg_away") or ev.get("xg_zero") or ev.get("dominant") == away):
+                    if ev.get("xg_away"):
+                        _resolve_intervention(str(eid), "xg_away", "ok")
+                    if ev.get("xg_zero"):
+                        _resolve_intervention(str(eid), "xg_zero", "ok")
+                    ev.pop("xg_away", None)
+                    ev.pop("xg_zero", None)
+                    _send(f"Aggiornamento intervento 🔄\n⚽ <b>GOAL{min_tag}</b>\n{comp}\n{home} {score_disp} <b>{away}</b>\n{_interventions_stats_line()}")  # noqa: E501
+            ev["score"] = score
 
             has_xg = bool(e.get("hasXg"))
             alltime = stats_by_id.get(eid, {})
@@ -345,18 +440,20 @@ def check_live_alerts() -> None:
             if xg_h is not None and xg_h > hs + _XG_GAP and not ev.get("xg_home") and not home_match_decided and not in_regular_time_endgame:  # noqa: E501
                 _send_live_alert(
                     f"{comp} · {home} {score_disp} {away}  ·  {min_}'\n"
-                    f"🟡 xG alto {home} ({xg_h:.2f} xG ma {hs} gol) → gol {home} probabile"
+                    f"🟡 xG alto {home} ({xg_h:.2f} xG ma {hs} gol) → gol {home} probabile",
                 )
                 ev["xg_home"] = True
                 ev["xg_home_goals"] = hs
+                _record_intervention(str(eid), "xg_home", home, f"{home} vs {away}", comp, min_)
 
             if xg_a is not None and xg_a > as_ + _XG_GAP and not ev.get("xg_away") and not away_match_decided and not in_regular_time_endgame:  # noqa: E501
                 _send_live_alert(
                     f"{comp} · {home} {score_disp} {away}  ·  {min_}'\n"
-                    f"🟡 xG alto {away} ({xg_a:.2f} xG ma {as_} gol) → gol {away} probabile"
+                    f"🟡 xG alto {away} ({xg_a:.2f} xG ma {as_} gol) → gol {away} probabile",
                 )
                 ev["xg_away"] = True
                 ev["xg_away_goals"] = as_
+                _record_intervention(str(eid), "xg_away", away, f"{home} vs {away}", comp, min_)
 
             # ── 🎯 xG elevato su 0-0 ──────────────────────────────────────────
             if (
@@ -368,10 +465,11 @@ def check_live_alerts() -> None:
                 _send_live_alert(
                     f"🎯 <b>xG elevato su 0-0 — {xg_h:.2f} + {xg_a:.2f} = {xg_h + xg_a:.2f}</b>\n"
                     f"{comp}\n"
-                    f"{home} 0–0 {away}{min_tag}"
+                    f"{home} 0–0 {away}{min_tag}",
                 )
                 ev["xg_zero"] = True
                 ev["xg_total"] = round(xg_h + xg_a, 2)
+                _record_intervention(str(eid), "xg_zero", f"{home}+{away}", f"{home} vs {away}", comp, min_)
 
             # ── ⚡ DA / SOT dominance ──────────────────────────────────────────
             if (has_da_dominance or has_sot_dominance) and not ev.get("da_dom") and da_ratio_h is not None:
@@ -383,10 +481,11 @@ def check_live_alerts() -> None:
                 _send_live_alert(
                     f"⚡ <b>Dominio — {dominant}{min_tag}</b>\n"
                     f"{comp} · {home} {score_disp} {away}\n"
-                    f"DA {da_pct}%{sot_str}"
+                    f"DA {da_pct}%{sot_str}",
                 )
                 ev["da_dom"] = True
                 ev["dominant"] = dominant
+                _record_intervention(str(eid), "da_dom", dominant, f"{home} vs {away}", comp, min_)
 
         except Exception:
             logger.exception("[alerts] Errore processing evento %d", eid)

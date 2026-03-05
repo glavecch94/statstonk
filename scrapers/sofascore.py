@@ -750,7 +750,7 @@ class SofaScoreScraper:
                     continue
                 start_ts = e.get("startTimestamp")
                 match_date = (
-                    datetime.fromtimestamp(start_ts, tz=UTC).astimezone(ZoneInfo("Europe/Rome")).replace(tzinfo=None)
+                    datetime.fromtimestamp(start_ts, tz=UTC).replace(tzinfo=None)
                     if start_ts
                     else None
                 )

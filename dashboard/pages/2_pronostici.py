@@ -222,6 +222,18 @@ def _bankroll_sim(sub: pd.DataFrame, bankroll: float) -> tuple[pd.DataFrame, flo
     return pd.DataFrame(rows).set_index("Data"), total_staked
 
 
+def _netto_giorno(sub: pd.DataFrame, bankroll: float) -> float | None:
+    """Somma netta del giorno sui pick puntabili completati. None se nessuno."""
+    completed = sub[sub["_esito_raw"].notna() & sub["Quota"].notna() & (sub["Quota"] >= _MIN_STAKE_QUOTA)]
+    if completed.empty:
+        return None
+    total = 0.0
+    for _, row in completed.iterrows():
+        stake = _stake_eur(int(row["Segnali"]), bankroll)
+        total += stake * (row["Quota"] - 1) if row["_esito_raw"] else -stake
+    return total
+
+
 def _fmt_esito(val) -> str:
     if val is True:
         return "✅"
@@ -269,8 +281,8 @@ def _render_table(sub: pd.DataFrame, bankroll: float) -> None:
         return f"+€{v:.0f}" if v >= 0 else f"−€{abs(v):.0f}"
 
     disp["Netto (€)"] = disp.apply(_netto, axis=1)
-    disp["Quota"] = disp["Quota"].apply(lambda q: f"{q:.2f}" if pd.notna(q) else "—")
     disp["Esito"] = disp["_esito_raw"].apply(_fmt_esito)
+    disp["Quota"] = disp["Quota"].apply(lambda q: f"{q:.2f}" if pd.notna(q) else "—")
     disp = disp.drop(columns=["_esito_raw"])
     st.dataframe(
         disp.style.map(_style_esito, subset=["Esito"]).map(_style_netto, subset=["Netto (€)"]),
@@ -345,9 +357,18 @@ for i, giorno in enumerate(giorni_ordinati):
 
     # Label testuale del giorno con mini-stats
     hit_str = f"{day_hit:.0f}% HR" if (day_won + day_lost) > 0 else "⏳"
+    n_multipla = int((day_df["Quota"].notna() & (day_df["Quota"] < _MIN_STAKE_QUOTA)).sum())
+    multipla_str = f" · 📋 {n_multipla} da multipla" if n_multipla > 0 else ""
+    netto_day = _netto_giorno(day_df, bankroll_init)
+    if netto_day is not None:
+        box = "🟩" if netto_day >= 0 else "🟥"
+        sign = "+" if netto_day >= 0 else "−"
+        netto_str = f" | {box} {sign}€{abs(netto_day):.0f}"
+    else:
+        netto_str = ""
     label = (
         f"**{_fmt_giorno(giorno)}** — "
-        f"{day_total} pick | ✅ {day_won} · ❌ {day_lost} · ⏳ {day_pending} | {hit_str}"
+        f"{day_total} pick | ✅ {day_won} · ❌ {day_lost} · ⏳ {day_pending} | {hit_str}{multipla_str}{netto_str}"
     )
 
     # Espandi di default i primi 2 giorni futuri (con partite ancora da giocare)
