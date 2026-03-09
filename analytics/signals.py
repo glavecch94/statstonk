@@ -926,6 +926,10 @@ def save_picks(
     }
 
     match_dt = match_date.to_pydatetime() if hasattr(match_date, "to_pydatetime") else match_date
+    # Normalizza a naive UTC per coerenza col DB (DateTime senza timezone=True)
+    if getattr(match_dt, "tzinfo", None) is not None:
+        from datetime import UTC as _UTC
+        match_dt = match_dt.astimezone(_UTC).replace(tzinfo=None)
 
     try:
         with get_session() as session:

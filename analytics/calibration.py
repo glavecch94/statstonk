@@ -96,6 +96,8 @@ def compute_market_stats() -> dict[str, dict]:
     for p in completed:
         if not p.quota or p.quota < _MIN_STAKE_QUOTA:
             continue  # escludi pick non puntabili dalle statistiche
+        if p.segnali < 3:
+            continue  # soglia minima di segnali per le statistiche
         m = p.mercato
         if m not in raw:
             raw[m] = {"n": 0, "won": 0, "roi_sum": 0.0, "quota_sum": 0.0}
@@ -140,6 +142,8 @@ def compute_league_stats() -> dict[str, dict]:
     for p in completed:
         if not p.quota or p.quota < _MIN_STAKE_QUOTA:
             continue  # escludi pick non puntabili dalle statistiche
+        if p.segnali < 3:
+            continue  # soglia minima di segnali per le statistiche
         lg = p.league
         if lg not in raw:
             raw[lg] = {"n": 0, "won": 0, "roi_sum": 0.0}
@@ -159,6 +163,102 @@ def compute_league_stats() -> dict[str, dict]:
             "roi": round(s["roi_sum"] / s["n"], 4) if s["n"] > 0 else 0.0,
         }
         for lg, s in raw.items()
+    }
+
+
+# ── Statistiche segnale età ───────────────────────────────────────────────────
+
+
+def compute_age_signal_stats() -> dict:
+    """
+    Calcola le performance dei pick aggiustati dal segnale età.
+    Legge age_adjusted_matches.json e incrocia con i pick completati nel DB.
+
+    Ritorna:
+    {
+        "boosted":  {n, won, hr, roi},   # pick +1 (squadra senior)
+        "penalized": {n, won, hr, roi},  # pick -1 (squadra giovane)
+        "matches": N,                    # partite con age signal
+    }
+    """
+    import json as _json
+
+    from config import DATA_DIR as _DATA_DIR
+    from db import SessionLocal
+    from models.picks import Pick
+
+    age_file = _DATA_DIR / "age_adjusted_matches.json"
+    if not age_file.exists():
+        return {}
+
+    try:
+        raw = _json.loads(age_file.read_text())
+        if isinstance(raw, list):
+            return {}  # vecchio formato, non ancora migrabile
+    except Exception:
+        return {}
+
+    # Costruisce set di (home, away, date_str, senior) per lookup rapido
+    age_matches: list[dict] = list(raw.values())
+    if not age_matches:
+        return {}
+
+    session = SessionLocal()
+    try:
+        completed = session.query(Pick).filter(Pick.esito.isnot(None)).all()
+    finally:
+        session.close()
+
+    # Indice per lookup: (home, away, date[:10]) → entry
+    idx: dict[tuple, dict] = {}
+    for entry in age_matches:
+        k = (entry.get("home", ""), entry.get("away", ""), entry.get("date", ""))
+        idx[k] = entry
+
+    _MIN_Q = _MIN_STAKE_QUOTA
+    boosted   = {"n": 0, "won": 0, "roi_sum": 0.0}
+    penalized = {"n": 0, "won": 0, "roi_sum": 0.0}
+
+    for p in completed:
+        if not p.quota or p.quota < _MIN_Q or p.segnali < 3:
+            continue
+        date_str = p.match_date.strftime("%Y-%m-%d") if p.match_date else ""
+        entry = idx.get((p.home_team, p.away_team, date_str))
+        if not entry:
+            continue
+
+        senior = entry.get("senior", "")
+        _AGE_H = {"1 — Vittoria Casa", "1X — Doppia Chance Casa", "Handicap −1 Casa"}
+        _AGE_A = {"2 — Vittoria Trasferta", "X2 — Doppia Chance Trasferta", "Handicap +1 Trasferta"}
+
+        home_is_senior = senior == p.home_team
+        if p.mercato in _AGE_H:
+            bucket = boosted if home_is_senior else penalized
+        elif p.mercato in _AGE_A:
+            bucket = boosted if not home_is_senior else penalized
+        else:
+            continue  # mercato non direzionale, non tracciato
+
+        bucket["n"] += 1
+        if p.esito:
+            bucket["won"] += 1
+            bucket["roi_sum"] += p.quota - 1
+        else:
+            bucket["roi_sum"] -= 1.0
+
+    def _fmt(b: dict) -> dict:
+        n = b["n"]
+        return {
+            "n": n,
+            "won": b["won"],
+            "hr": round(b["won"] / n, 4) if n > 0 else 0.0,
+            "roi": round(b["roi_sum"] / n, 4) if n > 0 else 0.0,
+        }
+
+    return {
+        "matches": len(age_matches),
+        "boosted": _fmt(boosted),
+        "penalized": _fmt(penalized),
     }
 
 
@@ -229,12 +329,14 @@ def save_calibration() -> dict:
 
     market_stats = compute_market_stats()
     league_stats = compute_league_stats()
+    age_signal_stats = compute_age_signal_stats()
     market_min_segnali, blocked_markets = _compute_adjustments(market_stats)
 
     calib = {
         "updated_at": datetime.utcnow().isoformat(),
         "markets": market_stats,
         "leagues": league_stats,
+        "age_signal": age_signal_stats,
         "market_min_segnali": market_min_segnali,
         "blocked_markets": blocked_markets,
     }

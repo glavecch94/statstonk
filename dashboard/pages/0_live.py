@@ -515,6 +515,22 @@ def _render_match_card(
             _badge = "🟢" if _confirmed else "🟡"
             _source = "UFFICIALI" if _confirmed else "PROBABILI"
             st.caption(f"{_badge} **{_source}** (SofaScore)")
+
+            # Età media XI titolari
+            _age_h = lineups.get("home", {}).get("avg_age")
+            _age_a = lineups.get("away", {}).get("avg_age")
+            if _age_h is not None or _age_a is not None:
+                _gap = abs((_age_h or 0) - (_age_a or 0)) if _age_h and _age_a else 0
+                _age_col_h, _age_col_a = st.columns(2)
+                with _age_col_h:
+                    if _age_h is not None:
+                        _warn = " 👶" if _age_a is not None and _gap >= 4 and _age_h < _age_a else ""  # noqa: E501
+                        st.caption(f"Età media XI: **{_age_h:.1f} anni**{_warn}")
+                with _age_col_a:
+                    if _age_a is not None:
+                        _warn = " 👶" if _age_h is not None and _gap >= 4 and _age_a < _age_h else ""  # noqa: E501
+                        st.caption(f"Età media XI: **{_age_a:.1f} anni**{_warn}")
+
             _col_lh, _col_la = st.columns(2)
             with _col_lh:
                 _sd = lineups.get("home", {})

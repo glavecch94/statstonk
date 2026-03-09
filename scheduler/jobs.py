@@ -6,10 +6,11 @@ per non bloccare gli altri job in caso di fallimento.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta
 
-from config import CURRENT_SEASON, HISTORICAL_SEASONS, LEAGUES
+from config import CURRENT_SEASON, DATA_DIR, HISTORICAL_SEASONS, LEAGUES
 from db import get_session
 from scrapers.sofascore import SofaScoreScraper, _season_to_ss_year
 
@@ -489,6 +490,101 @@ def _upsert_lineup(
             logger.exception(f"[job] _upsert_lineup error: {home_team} vs {away_team} [{side}]")
 
 
+_AGE_ADJUSTED_FILE = DATA_DIR / "age_adjusted_matches.json"
+
+# Mercati direzionali: home-side e away-side
+_AGE_HOME_MARKETS = {"1 — Vittoria Casa", "1X — Doppia Chance Casa", "Handicap −1 Casa"}
+_AGE_AWAY_MARKETS = {"2 — Vittoria Trasferta", "X2 — Doppia Chance Trasferta", "Handicap +1 Trasferta"}  # noqa: E501
+_AGE_GAP_THRESHOLD = 4.0
+
+
+def _load_age_adjusted() -> dict:
+    try:
+        if _AGE_ADJUSTED_FILE.exists():
+            data = json.loads(_AGE_ADJUSTED_FILE.read_text())
+            # Migrazione: vecchio formato lista → nuovo formato dict
+            if isinstance(data, list):
+                return {k: {} for k in data}
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_age_adjusted(data: dict) -> None:
+    try:
+        _AGE_ADJUSTED_FILE.write_text(json.dumps(data, indent=2))
+    except Exception as exc:
+        logger.warning("[job] age_signal: salvataggio tracking fallito: %s", exc)
+
+
+def _apply_age_signal(
+    home: str,
+    away: str,
+    match_date: object,
+    avg_age_home: float,
+    avg_age_away: float,
+) -> None:
+    """
+    Aggiusta i segnali dei pick pendenti in base al gap di età media XI.
+    +1 ai pick della squadra senior, -1 ai pick della squadra giovane.
+    Eseguito una sola volta per partita (tracking in age_adjusted_matches.json).
+    """
+    gap = abs(avg_age_home - avg_age_away)
+    if gap < _AGE_GAP_THRESHOLD:
+        return
+
+    date_str = match_date.strftime("%Y-%m-%d") if hasattr(match_date, "strftime") else str(match_date)[:10]  # noqa: E501
+    key = f"{home}|{away}|{date_str}"
+    adjusted = _load_age_adjusted()
+    if key in adjusted:
+        return
+
+    home_is_senior = avg_age_home > avg_age_away
+    senior = home if home_is_senior else away
+    young = away if home_is_senior else home
+    from models.picks import Pick
+
+    try:
+        with get_session() as session:
+            picks = (
+                session.query(Pick)
+                .filter(Pick.home_team == home, Pick.away_team == away, Pick.esito.is_(None))
+                .all()
+            )
+            updated = 0
+            for p in picks:
+                if p.mercato in _AGE_HOME_MARKETS:
+                    p.segnali += 1 if home_is_senior else -1
+                    p.segnali = max(1, p.segnali)
+                    updated += 1
+                elif p.mercato in _AGE_AWAY_MARKETS:
+                    p.segnali += 1 if not home_is_senior else -1
+                    p.segnali = max(1, p.segnali)
+                    updated += 1
+
+        logger.info(
+            "[job] age_signal: %s vs %s — senior=%s (%.1f) young=%s (%.1f) Δ=%.1f — %d pick aggiornati",  # noqa: E501
+            home, away, senior, max(avg_age_home, avg_age_away),
+            young, min(avg_age_home, avg_age_away), gap, updated,
+        )
+    except Exception:
+        logger.exception("[job] age_signal: errore per %s vs %s", home, away)
+        return
+
+    adjusted[key] = {
+        "home": home,
+        "away": away,
+        "date": date_str,
+        "senior": senior,
+        "young": young,
+        "avg_age_senior": round(max(avg_age_home, avg_age_away), 1),
+        "avg_age_young": round(min(avg_age_home, avg_age_away), 1),
+        "gap": round(gap, 1),
+    }
+    _save_age_adjusted(adjusted)
+
+
 def update_lineups() -> None:
     """
     Scarica e aggiorna nel DB le formazioni pre-partita da SofaScore.
@@ -560,6 +656,13 @@ def update_lineups() -> None:
                         league=league_key,
                         lineup_data=lineup_data,
                     )
+
+                    # Aggiusta segnali pick in base al gap di età
+                    age_h = lineup_data.get("home", {}).get("avg_age")
+                    age_a = lineup_data.get("away", {}).get("avg_age")
+                    if age_h is not None and age_a is not None:
+                        _apply_age_signal(home, away, fixture.get("date"), age_h, age_a)
+
     except Exception:
         logger.exception("[job] update_lineups: errore generale")
 

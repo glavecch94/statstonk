@@ -8,12 +8,16 @@ e dettaglio per giornata/campionato.
 from __future__ import annotations
 
 import datetime as _dt
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
 from config import HISTORICAL_SEASONS, LEAGUES
 from db import SessionLocal
+
+_TZ_ROME = ZoneInfo("Europe/Rome")
+_TZ_UTC  = ZoneInfo("UTC")
 
 st.set_page_config(page_title="Pronostici | Statstonk", layout="wide")
 st.title("📊 Pronostici")
@@ -64,19 +68,38 @@ def load_picks(leagues: tuple, _season: str) -> pd.DataFrame:
 
     rows = []
     for p in picks:
+        # match_date è naive UTC nel DB — converti a Europe/Rome per raggruppamento per giorno
+        md = p.match_date
+        if md is not None:
+            md_rome = md.replace(tzinfo=_TZ_UTC).astimezone(_TZ_ROME)
+        else:
+            md_rome = None
         rows.append({
             "Campionato":   LEAGUES.get(p.league, {}).get("name", p.league),
             "Giornata":     p.matchday if p.matchday else "—",
-            "data_dt":      p.match_date,
-            "data_giorno":  p.match_date.date() if p.match_date else None,
+            "data_dt":      md_rome if md_rome else md,
+            "data_giorno":  md_rome.date() if md_rome else None,
             "Partita":      f"{p.home_team} – {p.away_team}",
             "Mercato":      p.mercato,
             "Segnali":      p.segnali,
             "Quota":        p.quota,
             "_esito_raw":   p.esito,
+            "_pick_id":     p.id,
         })
 
-    return pd.DataFrame(rows)
+    df_raw = pd.DataFrame(rows)
+    if df_raw.empty:
+        return df_raw
+
+    # Deduplicazione: se esistono record multipli per (Partita, Mercato, data_giorno),
+    # tieni quello con esito impostato (conclusi prima dei pendenti), poi il più recente.
+    df_raw["_esito_ord"] = df_raw["_esito_raw"].apply(lambda v: 0 if v is not None else 1)
+    df_dedup = (
+        df_raw.sort_values(["_esito_ord", "_pick_id"], ascending=[True, False])
+        .drop_duplicates(subset=["Partita", "Mercato", "data_giorno"], keep="first")
+        .drop(columns=["_esito_ord", "_pick_id"])
+    )
+    return df_dedup
 
 
 df_full = load_picks(
@@ -224,7 +247,7 @@ def _bankroll_sim(sub: pd.DataFrame, bankroll: float) -> tuple[pd.DataFrame, flo
 
 def _netto_giorno(sub: pd.DataFrame, bankroll: float) -> float | None:
     """Somma netta del giorno sui pick puntabili completati. None se nessuno."""
-    completed = sub[sub["_esito_raw"].notna() & sub["Quota"].notna() & (sub["Quota"] >= _MIN_STAKE_QUOTA)]
+    completed = sub[sub["_esito_raw"].notna() & sub["Quota"].notna() & (sub["Quota"] >= _MIN_STAKE_QUOTA)]  # noqa: E501
     if completed.empty:
         return None
     total = 0.0
@@ -336,7 +359,7 @@ st.markdown("---")
 
 # ── Picks per giorno ──────────────────────────────────────────────────────────
 
-_today = _dt.date.today()
+_today = _dt.datetime.now(_TZ_ROME).date()
 giorni_ordinati = sorted(df["data_giorno"].dropna().unique(), reverse=True)
 # Giorni futuri (>= domani) ordinati crescenti — i primi 2 vanno aperti
 _future_days = sorted([d for d in giorni_ordinati if d >= _today])
@@ -368,7 +391,7 @@ for i, giorno in enumerate(giorni_ordinati):
         netto_str = ""
     label = (
         f"**{_fmt_giorno(giorno)}** — "
-        f"{day_total} pick | ✅ {day_won} · ❌ {day_lost} · ⏳ {day_pending} | {hit_str}{multipla_str}{netto_str}"
+        f"{day_total} pick | ✅ {day_won} · ❌ {day_lost} · ⏳ {day_pending} | {hit_str}{multipla_str}{netto_str}"  # noqa: E501
     )
 
     # Espandi di default i primi 2 giorni futuri (con partite ancora da giocare)
@@ -477,3 +500,27 @@ with st.expander("🔧 Calibrazione modello", expanded=False):
             "Effettiva": st.column_config.NumberColumn("Eff.", width="small"),
         },
     )
+
+    # ── Segnale età ────────────────────────────────────────────────────────────
+    age_sig = calib.get("age_signal", {})
+    if age_sig:
+        st.markdown("##### 👶 Segnale età (gap ≥ 4 anni)")
+        _b = age_sig.get("boosted", {})
+        _p = age_sig.get("penalized", {})
+        _matches = age_sig.get("matches", 0)
+        st.caption(f"Partite con age signal: {_matches}")
+        _ac1, _ac2 = st.columns(2)
+        with _ac1:
+            st.markdown("**+1 segnale (squadra senior)**")
+            if _b.get("n", 0) > 0:
+                st.metric("Pick", _b["n"])
+                st.metric("HR", f"{_b['hr'] * 100:.0f}%", delta=f"ROI {_b['roi'] * 100:+.1f}%")
+            else:
+                st.caption("Nessun dato ancora.")
+        with _ac2:
+            st.markdown("**−1 segnale (squadra giovane)**")
+            if _p.get("n", 0) > 0:
+                st.metric("Pick", _p["n"])
+                st.metric("HR", f"{_p['hr'] * 100:.0f}%", delta=f"ROI {_p['roi'] * 100:+.1f}%")
+            else:
+                st.caption("Nessun dato ancora.")

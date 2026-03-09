@@ -532,20 +532,36 @@ class SofaScoreScraper:
         if not data or ("home" not in data and "away" not in data):
             return None
 
+        now_ts = datetime.now(UTC).timestamp()
+
+        def _age_from_ts(dob_ts: int | None) -> float | None:
+            if not dob_ts:
+                return None
+            return (now_ts - dob_ts) / (365.25 * 86400)
+
         def _parse_side(sd: dict) -> dict:
+            players = [
+                {
+                    "name": p.get("player", {}).get("name", ""),
+                    "position": p.get("position", ""),
+                    "shirt_number": p.get("player", {}).get("shirtNumber"),
+                    "is_starting": not p.get("substitute", True),
+                    "is_captain": p.get("captain", False),
+                    "grid": p.get("grid"),  # "row:col" es. "2:3"
+                    "date_of_birth_ts": p.get("player", {}).get("dateOfBirthTimestamp"),
+                }
+                for p in sd.get("players", [])
+            ]
+            starter_ages = [
+                _age_from_ts(p["date_of_birth_ts"])
+                for p in players
+                if p.get("is_starting") and p.get("date_of_birth_ts")
+            ]
+            avg_age = round(sum(starter_ages) / len(starter_ages), 1) if starter_ages else None
             return {
                 "formation": sd.get("formation"),
-                "players": [
-                    {
-                        "name": p.get("player", {}).get("name", ""),
-                        "position": p.get("position", ""),
-                        "shirt_number": p.get("player", {}).get("shirtNumber"),
-                        "is_starting": not p.get("substitute", True),
-                        "is_captain": p.get("captain", False),
-                        "grid": p.get("grid"),  # "row:col" es. "2:3"
-                    }
-                    for p in sd.get("players", [])
-                ],
+                "players": players,
+                "avg_age": avg_age,
             }
 
         return {

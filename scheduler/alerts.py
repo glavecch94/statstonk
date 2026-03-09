@@ -140,6 +140,7 @@ _XG_GAP = 1.2          # xG > gol + questa soglia → alert / partita interessan
 _NO_LIVE_SKIP_SEC = 600  # secondi da attendere tra check quando non ci sono partite live
 _XG_ZERO_TOTAL = 1.8   # xG totale (home+away) ≥ soglia con score 0-0 → alert
 _DA_DOM_RATIO = 0.65   # dangerous attacks ratio ≥ soglia → alert / interessante
+_AGE_GAP = 4.0         # differenza età media XI titolari → alert squadra giovane
 
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
@@ -337,6 +338,16 @@ def check_live_alerts() -> None:
                 except Exception:
                     stats_by_id[e["id"]] = {}
 
+            # Step 2b: lineup per partite dove non abbiamo ancora controllato l'età
+            lineups_by_id: dict[int, dict | None] = {}
+            for e in live:
+                eid = e["id"]
+                if not state_now.get(str(eid), {}).get("age_gap_checked"):
+                    try:
+                        lineups_by_id[eid] = ss.get_lineups(eid)
+                    except Exception:
+                        lineups_by_id[eid] = None
+
     except Exception:
         logger.exception("[alerts] Errore scraping live")
         return
@@ -486,6 +497,27 @@ def check_live_alerts() -> None:
                 ev["da_dom"] = True
                 ev["dominant"] = dominant
                 _record_intervention(str(eid), "da_dom", dominant, f"{home} vs {away}", comp, min_)
+
+            # ── 👶 Età media — squadra giovane in campo ────────────────────────
+            if not ev.get("age_gap_checked") and eid in lineups_by_id:
+                lu = lineups_by_id[eid]
+                if lu:
+                    age_h = lu.get("home", {}).get("avg_age")
+                    age_a = lu.get("away", {}).get("avg_age")
+                    if age_h is not None and age_a is not None:
+                        gap = abs(age_h - age_a)
+                        if gap >= _AGE_GAP:
+                            young_team = home if age_h < age_a else away
+                            young_age = min(age_h, age_a)
+                            _send(
+                                f"👶 <b>Squadra giovane in campo{min_tag}</b>\n"
+                                f"{comp} · {home} {score_disp} {away}\n"
+                                f"{home}: {age_h:.1f} anni · {away}: {age_a:.1f} anni  (Δ {gap:.1f} anni)\n"  # noqa: E501
+                                f"⚠️ {young_team} in campo con età media {young_age:.1f} anni"
+                            )
+                        ev["age_gap_checked"] = True
+                elif min_ > 30:
+                    ev["age_gap_checked"] = True  # no lineup dopo 30', smetti di riprovare
 
         except Exception:
             logger.exception("[alerts] Errore processing evento %d", eid)
