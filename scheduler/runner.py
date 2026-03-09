@@ -48,8 +48,8 @@ logger = logging.getLogger(__name__)
 TIMEZONE = "Europe/Rome"
 
 
-def _register_jobs(scheduler) -> None:
-    """Registra tutti i job su un'istanza scheduler (blocking o background)."""
+def _register_data_jobs(scheduler) -> None:
+    """Registra i job di sync dati (usati sia da CLI che da dashboard)."""
 
     # Mattina: cattura partite del pomeriggio/sera precedente (tutte le leghe)
     scheduler.add_job(
@@ -121,6 +121,10 @@ def _register_jobs(scheduler) -> None:
         replace_existing=True,
     )
 
+
+def _register_telegram_jobs(scheduler) -> None:
+    """Registra i job Telegram — solo nel CLI scheduler, mai nella dashboard."""
+
     # Alert live Telegram: ogni 3 minuti
     scheduler.add_job(
         check_live_alerts,
@@ -128,6 +132,7 @@ def _register_jobs(scheduler) -> None:
         id="live_alerts",
         name="Alert live Telegram",
         misfire_grace_time=60,
+        max_instances=1,
         replace_existing=True,
     )
 
@@ -150,6 +155,12 @@ def _register_jobs(scheduler) -> None:
         misfire_grace_time=1800,
         replace_existing=True,
     )
+
+
+def _register_jobs(scheduler) -> None:
+    """Registra tutti i job (dati + Telegram) — uso interno per CLI."""
+    _register_data_jobs(scheduler)
+    _register_telegram_jobs(scheduler)
 
 
 def _run_missed_daily_jobs() -> None:
@@ -194,17 +205,13 @@ def start_background_scheduler() -> BackgroundScheduler:
 
     init_db()
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
-    _register_jobs(scheduler)
+    _register_data_jobs(scheduler)  # solo dati, NO Telegram (evita duplicati col CLI runner)
     scheduler.start()
-    logger.info("Background scheduler avviato dalla dashboard.")
+    logger.info("Background scheduler avviato dalla dashboard (solo job dati).")
 
     # Genera picks subito in background (non blocca il caricamento della UI)
     t = threading.Thread(target=generate_picks_all_leagues, daemon=True, name="picks-init")
     t.start()
-
-    # Invia in background i messaggi giornalieri persi (es. Mac era spento)
-    t2 = threading.Thread(target=_run_missed_daily_jobs, daemon=True, name="missed-daily")
-    t2.start()
 
     return scheduler
 
